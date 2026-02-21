@@ -34,8 +34,13 @@ const CATEGORIES = {
   person: { label:"Person", emoji:"👤", color:"#ec4899" },
 };
 
-const SYSTEM_PROMPT = `You are a helpful memory assistant. The user stores things they want to remember: tasks, notes, events, and people info.
-When the user wants to ADD something respond with JSON: {"action":"add","type":"task|note|event|person","title":"...","detail":"...","tags":[]}
+const BACKEND_URL = "https://your-app.railway.app"; // ← update after deploy
+
+const TODAY = new Date().toISOString().slice(0,10);
+const SYSTEM_PROMPT = `You are a helpful memory assistant. Today's date is ${TODAY}.
+The user stores things they want to remember: tasks, notes, events, and people info.
+When the user wants to ADD something respond with JSON: {"action":"add","type":"task|note|event|person","title":"...","detail":"...","tags":[],"dueDate":"YYYY-MM-DD or null"}
+Extract due dates from natural language (e.g. "by Friday", "next week", "Feb 28") and convert to YYYY-MM-DD format relative to today. If no date mentioned, use null.
 When the user wants to RECALL/LIST things respond with JSON: {"action":"recall","filter":"all|task|note|event|person","query":"...","reply":"..."}
 When the user wants to DELETE or mark done respond with JSON: {"action":"done","title":"approximate title"}
 For general chat respond with JSON: {"action":"chat","reply":"..."}
@@ -43,6 +48,14 @@ Always respond with valid JSON only, no markdown fences.`;
 
 const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2);
 const ls = { get: k => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } }, set: (k,v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} } };
+
+// Fire-and-forget backend sync — silent fail
+function syncToBackend(method, path, body) {
+  const url = BACKEND_URL + path;
+  const opts = { method, headers: { "Content-Type": "application/json" } };
+  if (body) opts.body = JSON.stringify(body);
+  fetch(url, opts).catch(() => {});
+}
 
 function App() {
   const [memories, setMemories] = useState(() => ls.get("memories_v1") || []);
@@ -54,7 +67,9 @@ function App() {
   const [qType, setQType] = useState("task");
   const [qTitle, setQTitle] = useState("");
   const [qDetail, setQDetail] = useState("");
+  const [qDueDate, setQDueDate] = useState("");
   const [notifPerm, setNotifPerm] = useState(Notification?.permission || "default");
+  const [backendOnline, setBackendOnline] = useState(null); // null=checking, true, false
   const [reminders, setReminders] = useState(() => ls.get("reminders_v1") || [
     { id:"r1", time:"12:00", label:"Midday Check-in", enabled:true },
     { id:"r2", time:"21:00", label:"Evening Review",  enabled:true },
@@ -66,9 +81,10 @@ function App() {
 
   const saveMem = m => { setMemories(m); ls.set("memories_v1", m); };
   const saveRem = r => { setReminders(r); ls.set("reminders_v1", r); };
-  const addMem  = (type, title, detail="", tags=[]) => {
-    const m = { id:genId(), type, title, detail, tags, done:false, createdAt:new Date().toISOString() };
+  const addMem  = (type, title, detail="", tags=[], dueDate=null) => {
+    const m = { id:genId(), type, title, detail, tags, done:false, dueDate: dueDate||null, createdAt:new Date().toISOString() };
     saveMem([m, ...memories]);
+    syncToBackend("POST", "/api/memories", m);
     return m;
   };
 
@@ -91,6 +107,35 @@ function App() {
     }, 30000);
     return () => clearInterval(t);
   }, [reminders, memories]);
+
+  // Backend health check (on mount + every 60s)
+  useEffect(() => {
+    const check = () => fetch(BACKEND_URL + "/health", { signal: AbortSignal.timeout(4000) })
+      .then(() => setBackendOnline(true))
+      .catch(() => setBackendOnline(false));
+    check();
+    const t = setInterval(check, 60000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Focus-poll: when window regains focus, sync done state from backend
+  useEffect(() => {
+    const onFocus = () => {
+      fetch(BACKEND_URL + "/api/memories", { signal: AbortSignal.timeout(5000) })
+        .then(r => r.json())
+        .then(remote => {
+          setMemories(prev => {
+            const doneIds = new Set(remote.filter(r => r.done).map(r => r.id));
+            const updated = prev.map(m => doneIds.has(m.id) ? { ...m, done: true } : m);
+            ls.set("memories_v1", updated);
+            return updated;
+          });
+        })
+        .catch(() => {});
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
 
   const [listening, setListening] = React.useState(false);
   const recRef = React.useRef(null);
@@ -126,8 +171,8 @@ function App() {
       let p; try { p = JSON.parse(raw); } catch { p = { action:"chat", reply: raw }; }
       let reply = "";
       if (p.action === "add") {
-        const m = addMem(p.type, p.title, p.detail||"", p.tags||[]);
-        reply = `Got it! Saved as a ${CATEGORIES[m.type]?.label}: "${m.title}" ${CATEGORIES[m.type]?.emoji}`;
+        const m = addMem(p.type, p.title, p.detail||"", p.tags||[], p.dueDate||null);
+        reply = `Got it! Saved as a ${CATEGORIES[m.type]?.label}: "${m.title}" ${CATEGORIES[m.type]?.emoji}${m.dueDate ? ` · Due ${m.dueDate}` : ""}`;
       } else if (p.action === "recall") {
         const f = p.filter||"all", q=(p.query||"").toLowerCase();
         const res2 = (f==="all"?memories:memories.filter(m=>m.type===f)).filter(m=>!q||m.title.toLowerCase().includes(q)||m.detail?.toLowerCase().includes(q));
@@ -135,7 +180,7 @@ function App() {
           (p.reply||"Here's what I found:") + "\n\n" + res2.slice(0,10).map(m=>`${CATEGORIES[m.type]?.emoji} **${m.title}**${m.detail?" — "+m.detail:""}${m.done?" ✓":""}`).join("\n");
       } else if (p.action === "done") {
         const idx = memories.findIndex(m=>m.title.toLowerCase().includes((p.title||"").toLowerCase()));
-        if (idx>=0) { const u=[...memories]; u[idx]={...u[idx],done:true}; saveMem(u); reply=`Marked "${u[idx].title}" as done! ✅`; }
+        if (idx>=0) { const u=[...memories]; u[idx]={...u[idx],done:true}; saveMem(u); syncToBackend("POST","/api/memories",u[idx]); reply=`Marked "${u[idx].title}" as done! ✅`; }
         else reply = "I couldn't find that task.";
       } else { reply = p.reply || "Try saying 'remember that...' or 'what do I have for...'"; }
       setMsgs(prev=>[...prev,{role:"assistant",text:reply}]);
@@ -156,9 +201,14 @@ function App() {
       {/* Header */}
       <div style={{padding:"14px 20px",background:"#1a1a24",borderBottom:"1px solid #2a2a38",display:"flex",alignItems:"center",gap:10}}>
         <span style={{fontSize:24}}>🧠</span>
-        <div>
+        <div style={{flex:1}}>
           <div style={{color:"#fff",fontWeight:700,fontSize:17}}>Memory Assistant</div>
           <div style={{color:"#888",fontSize:12}}>{memories.length} memories · {reminders.filter(r=>r.enabled).length} reminders active</div>
+        </div>
+        <div style={{textAlign:"right",fontSize:11,lineHeight:1.4}}>
+          {backendOnline === null && <span style={{color:"#888"}}>● checking…</span>}
+          {backendOnline === true  && <span style={{color:"#10b981"}}>● WhatsApp reminders on</span>}
+          {backendOnline === false && <span style={{color:"#ef4444"}}>● Backend offline</span>}
         </div>
       </div>
       {/* Tabs */}
@@ -214,11 +264,14 @@ function App() {
                   <div style={{flex:1}}>
                     <div style={{color:"#e8e8f0",fontWeight:600,fontSize:14,textDecoration:m.done?"line-through":"none"}}>{m.title}</div>
                     {m.detail && <div style={{color:"#888",fontSize:12,marginTop:3}}>{m.detail}</div>}
-                    <div style={{color:"#555",fontSize:11,marginTop:4}}>{new Date(m.createdAt).toLocaleDateString()}</div>
+                    <div style={{color:"#555",fontSize:11,marginTop:4}}>
+                    {new Date(m.createdAt).toLocaleDateString()}
+                    {m.dueDate && <span style={{color:"#6366f1",marginLeft:8}}>Due {m.dueDate}</span>}
+                  </div>
                   </div>
                   <div style={{display:"flex",gap:6}}>
-                    {m.type==="task" && <button onClick={()=>saveMem(memories.map(x=>x.id===m.id?{...x,done:!x.done}:x))} style={{background:m.done?"#10b981":"transparent",border:"1px solid #2a2a38",color:m.done?"#fff":"#888",borderRadius:6,padding:"2px 8px",cursor:"pointer",fontSize:12}}>{m.done?"✓":"○"}</button>}
-                    <button onClick={()=>saveMem(memories.filter(x=>x.id!==m.id))} style={{background:"transparent",border:"1px solid #2a2a38",color:"#666",borderRadius:6,padding:"2px 8px",cursor:"pointer",fontSize:12}}>🗑</button>
+                    {m.type==="task" && <button onClick={()=>{const u=memories.map(x=>x.id===m.id?{...x,done:!x.done}:x);saveMem(u);syncToBackend("POST","/api/memories",u.find(x=>x.id===m.id));}} style={{background:m.done?"#10b981":"transparent",border:"1px solid #2a2a38",color:m.done?"#fff":"#888",borderRadius:6,padding:"2px 8px",cursor:"pointer",fontSize:12}}>{m.done?"✓":"○"}</button>}
+                    <button onClick={()=>{saveMem(memories.filter(x=>x.id!==m.id));syncToBackend("DELETE","/api/memories/"+m.id);}} style={{background:"transparent",border:"1px solid #2a2a38",color:"#666",borderRadius:6,padding:"2px 8px",cursor:"pointer",fontSize:12}}>🗑</button>
                   </div>
                 </div>
               );
@@ -243,15 +296,20 @@ function App() {
           <div style={{marginBottom:12}}>
             <div style={{color:"#888",fontSize:13,marginBottom:6}}>Title *</div>
             <input value={qTitle} onChange={e=>setQTitle(e.target.value)} placeholder="What do you want to remember?"
-              onKeyDown={e=>e.key==="Enter"&&qTitle.trim()&&(addMem(qType,qTitle.trim(),qDetail.trim()),setQTitle(""),setQDetail(""))}
+              onKeyDown={e=>e.key==="Enter"&&qTitle.trim()&&(addMem(qType,qTitle.trim(),qDetail.trim(),[],qDueDate||null),setQTitle(""),setQDetail(""),setQDueDate(""))}
               style={{width:"100%",padding:"10px 14px",borderRadius:10,border:"1px solid #2a2a38",background:"#1e1e2e",color:"#e8e8f0",fontSize:14,outline:"none"}}/>
+          </div>
+          <div style={{marginBottom:12}}>
+            <div style={{color:"#888",fontSize:13,marginBottom:6}}>Due Date (optional)</div>
+            <input type="date" value={qDueDate} onChange={e=>setQDueDate(e.target.value)}
+              style={{width:"100%",padding:"10px 14px",borderRadius:10,border:"1px solid #2a2a38",background:"#1e1e2e",color:"#e8e8f0",fontSize:14,outline:"none",colorScheme:"dark"}}/>
           </div>
           <div style={{marginBottom:20}}>
             <div style={{color:"#888",fontSize:13,marginBottom:6}}>Details (optional)</div>
             <textarea value={qDetail} onChange={e=>setQDetail(e.target.value)} placeholder="Any extra context..." rows={3}
               style={{width:"100%",padding:"10px 14px",borderRadius:10,border:"1px solid #2a2a38",background:"#1e1e2e",color:"#e8e8f0",fontSize:14,outline:"none",resize:"vertical"}}/>
           </div>
-          <button disabled={!qTitle.trim()} onClick={()=>{addMem(qType,qTitle.trim(),qDetail.trim());setQTitle("");setQDetail("");}}
+          <button disabled={!qTitle.trim()} onClick={()=>{addMem(qType,qTitle.trim(),qDetail.trim(),[],qDueDate||null);setQTitle("");setQDetail("");setQDueDate("");}}
             style={{width:"100%",padding:"12px",borderRadius:12,border:"none",background:qTitle.trim()?"#6366f1":"#2a2a38",color:"#fff",fontWeight:700,fontSize:15,cursor:qTitle.trim()?"pointer":"not-allowed"}}>
             Save Memory ⚡
           </button>
