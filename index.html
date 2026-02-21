@@ -114,7 +114,7 @@ function App() {
       .then(() => setBackendOnline(true))
       .catch(() => setBackendOnline(false));
     check();
-    const t = setInterval(check, 60000);
+    const t = setInterval(check, 3 * 60 * 60 * 1000); // check every 3 hours
     return () => clearInterval(t);
   }, []);
 
